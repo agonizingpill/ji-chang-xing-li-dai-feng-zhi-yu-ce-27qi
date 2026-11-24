@@ -60,6 +60,52 @@ def migrate():
           id SERIAL PRIMARY KEY, actor_id INT REFERENCES users(id), action TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id INT, detail JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         ''')
+        # 峰值预测状态扩展：主管可跳过卡住的申请（skipped），跳过后迟到的结果只留档（archived）
+        conn.execute("""
+        DO $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname='peak_forecasts_status_check')
+             AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='peak_forecasts_status_check'
+                             AND pg_get_constraintdef(oid) LIKE '%archived%') THEN
+            ALTER TABLE peak_forecasts DROP CONSTRAINT peak_forecasts_status_check;
+            ALTER TABLE peak_forecasts ADD CONSTRAINT peak_forecasts_status_check
+              CHECK (status IN ('queued','running','ready','blocked','failed','published','skipped','archived'));
+          END IF;
+        END $$;
+        """)
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS duty_shifts (
+          id SERIAL PRIMARY KEY, shift_code TEXT UNIQUE NOT NULL, owner_id INT NOT NULL REFERENCES users(id),
+          started_at TIMESTAMPTZ NOT NULL DEFAULT now(), ended_at TIMESTAMPTZ,
+          handed_over_to INT REFERENCES users(id), handover_note TEXT DEFAULT '',
+          status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','closed'))
+        );
+        CREATE TABLE IF NOT EXISTS congestion_alerts (
+          id SERIAL PRIMARY KEY, wave_id INT NOT NULL REFERENCES flight_waves(id),
+          status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','cleared')),
+          open_forecast_id INT REFERENCES peak_forecasts(id), clear_forecast_id INT REFERENCES peak_forecasts(id),
+          opened_by INT REFERENCES users(id), cleared_by INT REFERENCES users(id),
+          open_basis JSONB NOT NULL DEFAULT '{}'::jsonb, clear_basis JSONB NOT NULL DEFAULT '{}'::jsonb,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(), cleared_at TIMESTAMPTZ
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS one_open_alert_per_wave
+          ON congestion_alerts(wave_id) WHERE status='open';
+        CREATE TABLE IF NOT EXISTS congestion_alert_evaluations (
+          id SERIAL PRIMARY KEY, forecast_id INT NOT NULL UNIQUE REFERENCES peak_forecasts(id),
+          wave_id INT NOT NULL REFERENCES flight_waves(id), predicted_next_4 JSONB NOT NULL,
+          threshold INT NOT NULL, breach BOOLEAN NOT NULL, consecutive_breach INT NOT NULL,
+          consecutive_low INT NOT NULL, action TEXT NOT NULL CHECK (action IN ('none','opened','cleared','archived')),
+          alert_id INT REFERENCES congestion_alerts(id), detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+          evaluated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS idx_alert_eval_wave ON congestion_alert_evaluations(wave_id, id);
+        CREATE TABLE IF NOT EXISTS congestion_alert_signoffs (
+          id SERIAL PRIMARY KEY, alert_id INT NOT NULL REFERENCES congestion_alerts(id),
+          duty_shift_id INT NOT NULL REFERENCES duty_shifts(id), signer_id INT NOT NULL REFERENCES users(id),
+          note TEXT DEFAULT '', signed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          UNIQUE(alert_id, duty_shift_id)
+        );
+        ''')
 
 def audit(conn, actor_id, action, entity_type, entity_id=None, detail=None):
     conn.execute('INSERT INTO audit_logs(actor_id,action,entity_type,entity_id,detail) VALUES (%s,%s,%s,%s,%s::jsonb)', (actor_id, action, entity_type, entity_id, __import__('json').dumps(detail or {}, ensure_ascii=False)))

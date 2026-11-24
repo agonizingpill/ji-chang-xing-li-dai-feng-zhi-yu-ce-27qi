@@ -6,6 +6,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from .casework_routes import router as operational_cases
 from .operations_evidence import router as operations_evidence
+from .congestion_watch_routes import router as congestion_watch
 from .auth import current_user, issue, password_hash, require
 from .db import audit, connect, migrate, wait_for_db
 from .schemas import Login, WaveIn, CountIn, ForecastIn, ShiftIn, ConfirmIn, ReviewIn
@@ -23,6 +24,7 @@ async def lifespan(_):
 app=FastAPI(title='机场行李带峰值预测', lifespan=lifespan)
 app.include_router(operational_cases)
 app.include_router(operations_evidence)
+app.include_router(congestion_watch)
 @app.middleware('http')
 async def guard(request: Request, call_next):
     started=time.monotonic()
@@ -98,8 +100,11 @@ def publish(forecast_id:int,user=Depends(require('operator','supervisor'))):
 @app.post('/forecasts/{forecast_id}/retry',status_code=202)
 def retry(forecast_id:int,user=Depends(require('operator','supervisor'))):
     with connect() as conn:
-        row=conn.execute("UPDATE peak_forecasts SET status='queued',failure_reason=NULL WHERE id=%s AND status='failed' RETURNING *",(forecast_id,)).fetchone()
-        if not row: raise HTTPException(409,'只有失败预测可以重试')
+        forecast=conn.execute('SELECT * FROM peak_forecasts WHERE id=%s',(forecast_id,)).fetchone()
+        if not forecast: raise HTTPException(404,'预测申请不存在')
+        if forecast['status']=='archived': raise HTTPException(409,'迟到预测数据已留档，不能重试')
+        row=conn.execute("UPDATE peak_forecasts SET status='queued',failure_reason=NULL WHERE id=%s AND status IN ('failed','skipped') RETURNING *",(forecast_id,)).fetchone()
+        if not row: raise HTTPException(409,'只有失败或已跳过的预测可以重试')
         conn.commit()
     r.rpush('airport:forecast',str(forecast_id)); return row
 @app.get('/shifts')
